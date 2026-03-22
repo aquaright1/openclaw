@@ -227,8 +227,12 @@ export function createDiscordMessageHandler(
             clearPendingDuplicateDeliveries(dedupeKeys);
           },
           onTimeout: (settledAfterTimeout) => {
-            void settledAfterTimeout.then(() => {
+            void settledAfterTimeout.then((outcome) => {
               clearInFlightDedupeKeys(dedupeKeys);
+              if (outcome === "success") {
+                clearPendingDuplicateDeliveries(dedupeKeys);
+                return;
+              }
               releaseDedupeKeys(dedupeKeys);
               replayPendingDuplicateDeliveries(dedupeKeys);
             });
@@ -298,8 +302,12 @@ export function createDiscordMessageHandler(
           clearPendingDuplicateDeliveries(dedupeKeys);
         },
         onTimeout: (settledAfterTimeout) => {
-          void settledAfterTimeout.then(() => {
+          void settledAfterTimeout.then((outcome) => {
             clearInFlightDedupeKeys(dedupeKeys);
+            if (outcome === "success") {
+              clearPendingDuplicateDeliveries(dedupeKeys);
+              return;
+            }
             releaseDedupeKeys(dedupeKeys);
             replayPendingDuplicateDeliveries(dedupeKeys);
           });

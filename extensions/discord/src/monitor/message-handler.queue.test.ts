@@ -278,6 +278,9 @@ describe("createDiscordMessageHandler queue behavior", () => {
         expect.stringContaining("discord inbound worker failed: Error: worker boom"),
       );
     });
+    expect(params.runtime.error).not.toHaveBeenCalledWith(
+      expect.stringContaining("discord inbound worker failed after timeout"),
+    );
 
     await expect(handler(duplicate as never, {} as never)).resolves.toBeUndefined();
 
@@ -462,7 +465,7 @@ describe("createDiscordMessageHandler queue behavior", () => {
     expect(preflightDiscordMessageMock).toHaveBeenCalledTimes(1);
   });
 
-  it("applies explicit inbound worker timeout to queued runs so stalled runs do not block the queue", async () => {
+  it("keeps the dedupe claim when a timed-out worker later succeeds while still unblocking later queued runs", async () => {
     vi.useFakeTimers();
     try {
       preflightDiscordMessageMock.mockReset();
@@ -516,12 +519,78 @@ describe("createDiscordMessageHandler queue behavior", () => {
       expect(firstCtx?.abortSignal?.aborted).toBe(true);
       firstRunAfterAbort.resolve();
 
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(firstCtx?.abortSignal?.aborted).toBe(true);
+      expect(processDiscordMessageMock).toHaveBeenCalledTimes(2);
+      expect(params.runtime.error).toHaveBeenCalledWith(
+        expect.stringContaining("discord inbound worker timed out after"),
+      );
+      await expect(retryCall).resolves.toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("replays a timed-out delivery when the original run later fails", async () => {
+    vi.useFakeTimers();
+    try {
+      preflightDiscordMessageMock.mockReset();
+      processDiscordMessageMock.mockReset();
+      const firstRunAfterAbort = createDeferred();
+
+      processDiscordMessageMock
+        .mockImplementationOnce(async (ctx: { abortSignal?: AbortSignal }) => {
+          await new Promise<void>((resolve, reject) => {
+            if (ctx.abortSignal?.aborted) {
+              return;
+            }
+            ctx.abortSignal?.addEventListener(
+              "abort",
+              () => {
+                void firstRunAfterAbort.promise.then(() => reject(new Error("worker boom")));
+              },
+              { once: true },
+            );
+          });
+        })
+        .mockImplementationOnce(async () => undefined)
+        .mockImplementationOnce(async () => undefined);
+
+      const params = createDiscordHandlerParams({ workerRunTimeoutMs: 50 });
+      preflightDiscordMessageMock.mockImplementation(
+        async (preflightParams: { data: { channel_id: string } }) =>
+          createPreflightContext(preflightParams.data.channel_id),
+      );
+      const handler = createDiscordMessageHandler(params);
+
+      await expect(
+        handler(createMessageData("m-1") as never, {} as never),
+      ).resolves.toBeUndefined();
+      await expect(
+        handler(createMessageData("m-2") as never, {} as never),
+      ).resolves.toBeUndefined();
+
+      await vi.advanceTimersByTimeAsync(60);
+      await vi.waitFor(() => {
+        expect(processDiscordMessageMock).toHaveBeenCalledTimes(2);
+      });
+
+      const retryCall = handler(createMessageData("m-1") as never, {} as never);
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(processDiscordMessageMock).toHaveBeenCalledTimes(2);
+
+      firstRunAfterAbort.resolve();
+
       await vi.waitFor(() => {
         expect(processDiscordMessageMock).toHaveBeenCalledTimes(3);
       });
-      expect(firstCtx?.abortSignal?.aborted).toBe(true);
       expect(params.runtime.error).toHaveBeenCalledWith(
         expect.stringContaining("discord inbound worker timed out after"),
+      );
+      expect(params.runtime.error).toHaveBeenCalledWith(
+        expect.stringContaining("discord inbound worker failed after timeout: Error: worker boom"),
       );
       await expect(retryCall).resolves.toBeUndefined();
     } finally {

@@ -72,7 +72,10 @@ export async function runDiscordTaskWithTimeout(params: {
   onTimeout: (timeoutMs: number) => void;
   onAbortAfterTimeout?: () => void;
   onErrorAfterTimeout?: (error: unknown) => void;
-}): Promise<{ timedOut: boolean; settledAfterTimeout?: Promise<void> }> {
+}): Promise<{
+  timedOut: boolean;
+  settledAfterTimeout?: Promise<"success" | "aborted" | "error">;
+}> {
   const timeoutAbortController = params.timeoutMs ? new AbortController() : undefined;
   const mergedAbortSignal = mergeAbortSignals([
     ...(params.abortSignals ?? []),
@@ -81,19 +84,19 @@ export async function runDiscordTaskWithTimeout(params: {
 
   let timedOut = false;
   let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
-  const runPromise = params.run(mergedAbortSignal).catch((error) => {
-    if (!timedOut) {
-      throw error;
-    }
-    if (timeoutAbortController?.signal.aborted && isAbortError(error)) {
-      params.onAbortAfterTimeout?.();
-      return;
-    }
-    params.onErrorAfterTimeout?.(error);
-  });
-  const runSettledPromise = runPromise.then(
-    () => undefined,
-    () => undefined,
+  const runPromise = params.run(mergedAbortSignal);
+  const runOutcomePromise = runPromise.then(
+    () => "success" as const,
+    (error) => {
+      if (timeoutAbortController?.signal.aborted && isAbortError(error)) {
+        params.onAbortAfterTimeout?.();
+        return "aborted" as const;
+      }
+      if (timedOut) {
+        params.onErrorAfterTimeout?.(error);
+      }
+      return "error" as const;
+    },
   );
 
   try {
@@ -113,7 +116,7 @@ export async function runDiscordTaskWithTimeout(params: {
       timedOut = true;
       timeoutAbortController?.abort();
       params.onTimeout(params.timeoutMs);
-      return { timedOut: true, settledAfterTimeout: runSettledPromise };
+      return { timedOut: true, settledAfterTimeout: runOutcomePromise };
     }
     return { timedOut: false };
   } finally {
