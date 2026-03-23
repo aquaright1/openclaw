@@ -2,6 +2,10 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  clearRuntimeAuthProfileStoreSnapshots,
+  replaceRuntimeAuthProfileStoreSnapshots,
+} from "../agents/auth-profiles.js";
 import { NON_ENV_SECRETREF_MARKER } from "../agents/model-auth-markers.js";
 
 const resolveProviderUsageAuthWithPluginMock = vi.fn(async (..._args: unknown[]) => null);
@@ -10,8 +14,21 @@ vi.mock("../plugins/provider-runtime.js", () => ({
   resolveProviderUsageAuthWithPlugin: resolveProviderUsageAuthWithPluginMock,
 }));
 
+vi.mock("../agents/cli-credentials.js", () => ({
+  readCodexCliCredentialsCached: () => null,
+  readQwenCliCredentialsCached: () => null,
+  readMiniMaxCliCredentialsCached: () => null,
+}));
+
 let resolveProviderAuths: typeof import("./provider-usage.auth.js").resolveProviderAuths;
 type ProviderAuth = import("./provider-usage.auth.js").ProviderAuth;
+type AuthProfileStore = import("../agents/auth-profiles.js").AuthProfileStore;
+type OpenClawConfig = Parameters<typeof resolveProviderAuths>[0]["config"];
+
+function normalizeProviderForTest(provider: string) {
+  const normalized = provider.trim().toLowerCase();
+  return normalized === "z-ai" || normalized === "z.ai" ? "zai" : normalized;
+}
 
 describe("resolveProviderAuths key normalization", () => {
   let suiteRoot = "";
@@ -41,7 +58,7 @@ describe("resolveProviderAuths key normalization", () => {
   });
 
   async function withSuiteHome<T>(
-    fn: (home: string) => Promise<T>,
+    fn: (home: string, env: NodeJS.ProcessEnv) => Promise<T>,
     env: Record<string, string | undefined>,
   ): Promise<T> {
     const base = path.join(suiteRoot, `case-${++suiteCase}`);
@@ -55,7 +72,6 @@ describe("resolveProviderAuths key normalization", () => {
       "HOMEPATH",
       "OPENCLAW_HOME",
       "OPENCLAW_STATE_DIR",
-      ...Object.keys(env),
     ]);
     const snapshot: Record<string, string | undefined> = {};
     for (const key of keysToRestore) {
@@ -73,16 +89,21 @@ describe("resolveProviderAuths key normalization", () => {
     }
     delete process.env.OPENCLAW_HOME;
     process.env.OPENCLAW_STATE_DIR = path.join(base, ".openclaw");
+    const runtimeEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+    };
     for (const [key, value] of Object.entries(env)) {
       if (value === undefined) {
-        delete process.env[key];
+        delete runtimeEnv[key];
       } else {
-        process.env[key] = value;
+        runtimeEnv[key] = value;
       }
     }
+    replaceRuntimeAuthProfileStoreSnapshots([{ store: { version: 1, profiles: {} } }]);
     try {
-      return await fn(base);
+      return await fn(base, runtimeEnv);
     } finally {
+      clearRuntimeAuthProfileStoreSnapshots();
       for (const [key, value] of Object.entries(snapshot)) {
         if (value === undefined) {
           delete process.env[key];
@@ -93,14 +114,16 @@ describe("resolveProviderAuths key normalization", () => {
     }
   }
 
-  async function writeAuthProfiles(home: string, profiles: Record<string, unknown>) {
+  async function writeAuthProfiles(home: string, profiles: AuthProfileStore["profiles"]) {
     const agentDir = path.join(home, ".openclaw", "agents", "main", "agent");
+    const store = { version: 1, profiles } satisfies AuthProfileStore;
     await fs.mkdir(agentDir, { recursive: true });
     await fs.writeFile(
       path.join(agentDir, "auth-profiles.json"),
-      `${JSON.stringify({ version: 1, profiles }, null, 2)}\n`,
+      `${JSON.stringify(store, null, 2)}\n`,
       "utf8",
     );
+    replaceRuntimeAuthProfileStoreSnapshots([{ store }]);
   }
 
   async function writeConfig(home: string, config: Record<string, unknown>) {
@@ -111,6 +134,16 @@ describe("resolveProviderAuths key normalization", () => {
       `${JSON.stringify(config, null, 2)}\n`,
       "utf8",
     );
+  }
+
+  async function loadConfigForSuiteHome(home: string): Promise<OpenClawConfig> {
+    try {
+      return JSON.parse(
+        await fs.readFile(path.join(home, ".openclaw", "openclaw.json"), "utf8"),
+      ) as OpenClawConfig;
+    } catch {
+      return {} as OpenClawConfig;
+    }
   }
 
   async function writeProfileOrder(home: string, provider: string, profileIds: string[]) {
@@ -128,6 +161,7 @@ describe("resolveProviderAuths key normalization", () => {
       path.join(agentDir, "auth-profiles.json"),
       `${JSON.stringify(parsed, null, 2)}\n`,
     );
+    replaceRuntimeAuthProfileStoreSnapshots([{ store: parsed as AuthProfileStore }]);
   }
 
   async function writeLegacyPiAuth(home: string, raw: string) {
@@ -150,7 +184,7 @@ describe("resolveProviderAuths key normalization", () => {
 
   async function resolveMinimaxAuthFromConfiguredKey(apiKey: string) {
     return await withSuiteHome(
-      async (home) => {
+      async (home, env) => {
         await writeConfig(home, {
           models: {
             providers: {
@@ -162,15 +196,98 @@ describe("resolveProviderAuths key normalization", () => {
             },
           },
         });
+        const config = await loadConfigForSuiteHome(home);
 
         return await resolveProviderAuths({
           providers: ["minimax"],
+          config,
+          env,
         });
       },
       {
         ...EMPTY_PROVIDER_ENV,
       },
     );
+  }
+
+  async function resolveProviderAuthsWithIsolatedStore(params: {
+    providers: Parameters<typeof resolveProviderAuths>[0]["providers"];
+    env?: NodeJS.ProcessEnv;
+    config?: OpenClawConfig;
+    store?: AuthProfileStore;
+    order?: Record<string, string[]>;
+  }) {
+    const store = params.store ?? { version: 1, profiles: {} };
+    const listProfilesForProvider = (provider: string) =>
+      Object.entries(store.profiles)
+        .filter(([, credential]) => {
+          const providerId =
+            credential && typeof credential === "object" && "provider" in credential
+              ? credential.provider
+              : undefined;
+          return (
+            typeof providerId === "string" &&
+            normalizeProviderForTest(providerId) === normalizeProviderForTest(provider)
+          );
+        })
+        .map(([profileId]) => profileId);
+    vi.resetModules();
+    vi.doMock("../plugins/provider-runtime.js", () => ({
+      resolveProviderUsageAuthWithPlugin: async () => null,
+    }));
+    vi.doMock("../agents/auth-profiles.js", () => ({
+      dedupeProfileIds: (profileIds: string[]) => [...new Set(profileIds)],
+      ensureAuthProfileStore: () => store,
+      listProfilesForProvider: (_store: AuthProfileStore, provider: string) =>
+        listProfilesForProvider(provider),
+      resolveApiKeyForProfile: async ({ profileId }: { profileId: string }) => {
+        const credential = store.profiles[profileId];
+        if (!credential || typeof credential !== "object" || !("type" in credential)) {
+          return null;
+        }
+        if (
+          credential.type === "oauth" &&
+          "access" in credential &&
+          typeof credential.access === "string"
+        ) {
+          return { apiKey: credential.access };
+        }
+        if (
+          credential.type === "api_key" &&
+          "key" in credential &&
+          typeof credential.key === "string"
+        ) {
+          return { apiKey: credential.key };
+        }
+        if (
+          credential.type === "token" &&
+          "token" in credential &&
+          typeof credential.token === "string"
+        ) {
+          return { apiKey: credential.token };
+        }
+        return null;
+      },
+      resolveAuthProfileOrder: ({ provider }: { provider: string }) =>
+        params.order?.[provider] ?? listProfilesForProvider(provider),
+    }));
+    vi.doMock("../config/config.js", () => ({
+      loadConfig: () => params.config ?? {},
+    }));
+    try {
+      const { resolveProviderAuths: isolatedResolveProviderAuths } =
+        await import("./provider-usage.auth.js");
+      return await isolatedResolveProviderAuths({
+        providers: params.providers,
+        config: params.config ?? ({} as OpenClawConfig),
+        env: params.env,
+      });
+    } finally {
+      vi.doUnmock("../plugins/provider-runtime.js");
+      vi.doUnmock("../agents/auth-profiles.js");
+      vi.doUnmock("../config/config.js");
+      vi.resetModules();
+    }
   }
 
   async function expectResolvedAuthsFromSuiteHome(params: {
@@ -180,10 +297,13 @@ describe("resolveProviderAuths key normalization", () => {
     setup?: (home: string) => Promise<void>;
   }) {
     await withSuiteHome(
-      async (home) => {
+      async (home, env) => {
         await params.setup?.(home);
+        const config = await loadConfigForSuiteHome(home);
         const auths = await resolveProviderAuths({
           providers: params.providers,
+          config,
+          env,
         });
         expect(auths).toEqual(params.expected);
       },
@@ -241,7 +361,11 @@ describe("resolveProviderAuths key normalization", () => {
     env: Record<string, string | undefined>;
     expected: ProviderAuth[];
   }>)("$name", async ({ providers, env, expected }) => {
-    await expectResolvedAuthsFromSuiteHome({ providers: [...providers], env, expected });
+    const auths = await resolveProviderAuthsWithIsolatedStore({
+      providers: [...providers],
+      env,
+    });
+    expect(auths).toEqual(expected);
   });
 
   it("strips embedded CR/LF from stored auth profiles (token + api_key)", async () => {
@@ -271,16 +395,22 @@ describe("resolveProviderAuths key normalization", () => {
   it("falls back to legacy .pi auth file for zai keys even after os.homedir() is primed", async () => {
     // Prime os.homedir() to simulate long-lived workers that may have touched it before HOME changes.
     os.homedir();
-    await expectResolvedAuthsFromSuiteHome({
-      providers: ["zai"],
-      setup: async (home) => {
+    await withSuiteHome(
+      async (home, env) => {
         await writeLegacyPiAuth(
           home,
           `${JSON.stringify({ "z-ai": { access: "legacy-zai-key" } }, null, 2)}\n`,
         );
+        const auths = await resolveProviderAuthsWithIsolatedStore({
+          providers: ["zai"],
+          env,
+        });
+        expect(auths).toEqual([{ provider: "zai", token: "legacy-zai-key" }]);
       },
-      expected: [{ provider: "zai", token: "legacy-zai-key" }],
-    });
+      {
+        ...EMPTY_PROVIDER_ENV,
+      },
+    );
   });
 
   it.each([
@@ -383,7 +513,7 @@ describe("resolveProviderAuths key normalization", () => {
   });
 
   it("discovers oauth provider from config but skips mismatched profile providers", async () => {
-    await withSuiteHome(async (home) => {
+    await withSuiteHome(async (home, env) => {
       await writeConfig(home, {
         auth: {
           profiles: {
@@ -398,25 +528,31 @@ describe("resolveProviderAuths key normalization", () => {
           token: "mismatched-provider-token",
         },
       });
+      const config = await loadConfigForSuiteHome(home);
 
       const auths = await resolveProviderAuths({
         providers: ["anthropic"],
+        config,
+        env,
       });
       expect(auths).toEqual([]);
     }, {});
   });
 
   it("skips providers without oauth-compatible profiles", async () => {
-    await withSuiteHome(async () => {
+    await withSuiteHome(async (home, env) => {
+      const config = await loadConfigForSuiteHome(home);
       const auths = await resolveProviderAuths({
         providers: ["anthropic"],
+        config,
+        env,
       });
       expect(auths).toEqual([]);
     }, {});
   });
 
   it("skips oauth profiles that resolve without an api key and uses later profiles", async () => {
-    await withSuiteHome(async (home) => {
+    await withSuiteHome(async (home, env) => {
       await writeAuthProfiles(home, {
         "anthropic:empty": {
           type: "token",
@@ -427,24 +563,30 @@ describe("resolveProviderAuths key normalization", () => {
         "anthropic:valid": { type: "token", provider: "anthropic", token: "anthropic-token" },
       });
       await writeProfileOrder(home, "anthropic", ["anthropic:empty", "anthropic:valid"]);
+      const config = await loadConfigForSuiteHome(home);
 
       const auths = await resolveProviderAuths({
         providers: ["anthropic"],
+        config,
+        env,
       });
       expect(auths).toEqual([{ provider: "anthropic", token: "anthropic-token" }]);
     }, {});
   });
 
   it("skips api_key entries in oauth token resolution order", async () => {
-    await withSuiteHome(async (home) => {
+    await withSuiteHome(async (home, env) => {
       await writeAuthProfiles(home, {
         "anthropic:api": { type: "api_key", provider: "anthropic", key: "api-key-1" },
         "anthropic:token": { type: "token", provider: "anthropic", token: "token-1" },
       });
       await writeProfileOrder(home, "anthropic", ["anthropic:api", "anthropic:token"]);
+      const config = await loadConfigForSuiteHome(home);
 
       const auths = await resolveProviderAuths({
         providers: ["anthropic"],
+        config,
+        env,
       });
       expect(auths).toEqual([{ provider: "anthropic", token: "token-1" }]);
     }, {});
